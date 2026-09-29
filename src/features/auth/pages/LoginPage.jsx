@@ -32,7 +32,7 @@ export function LoginPage() {
     <div className="min-h-screen bg-[#0f172a] text-slate-100 flex items-center justify-center p-4">
       <div className="w-full max-w-md bg-[#1e293b] p-8 rounded-xl border border-slate-700 shadow-2xl">
         <div className="mb-6 text-center">
-          <h1 className="text-2xl font-bold text-sky-400">WMS Control de Salida</h1>
+          <h1 className="text-2xl font-bold text-sky-400">WMS Control de Gestion de Salida</h1>
           <p className="text-sm text-slate-400 mt-1">Ingresa tus credenciales para acceder</p>
         </div>
 

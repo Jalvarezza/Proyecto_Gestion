@@ -1,7 +1,8 @@
 // src/features/notas/components/ImportarNotaFlow.jsx
-import React, { useState, useRef } from 'react';
+import { useState, useRef } from 'react';
 import { parsearNota } from '../utils/parsearNota';
 import { productosApi, notasApi } from '../services/notasService';
+import { onlyNumbersKeyDown, onlyNumbersPaste } from '../../../shared/utils/numericInput';
 
 export function ImportarNotaFlow({ adminId, onVolver, onCreada }) {
   const pdfRef = useRef(null);
@@ -21,75 +22,134 @@ export function ImportarNotaFlow({ adminId, onVolver, onCreada }) {
   const [filas, setFilas] = useState([]);
   const [textoDebug, setTextoDebug] = useState(null);
 
+  function normalizarCodigo(codigo) {
+    if (!codigo) return '';
+    const str = String(codigo).trim();
+    return /^\d+$/.test(str) ? String(parseInt(str, 10)) : str;
+  }
+
+  // ── Paso 1: Parsear PDF y consultar productos ─────────────────────────────
+
   async function handleProcesar() {
     if (!archivoPDF) return;
     setErrorUI(null);
     setErroresParseo([]);
     setProcesando(true);
 
-    const resultado = await parsearNota(archivoPDF);
+    try {
+      const resultado = await parsearNota(archivoPDF);
 
-    if (resultado.errores.length > 0) setErroresParseo(resultado.errores);
-    if (resultado.productos.length === 0 && resultado._textoDebug) {
-      setTextoDebug(resultado._textoDebug);
-    } else {
-      setTextoDebug(null);
-    }
+      const errores = resultado.errores || [];
+      const productosRaw = resultado.productos || resultado.items || [];
+      const debugText = resultado._textoDebug || null;
 
-    setNumeroNota(resultado.numeroNota ?? '');
-    setNombreCliente(resultado.nombreCliente ?? '');
-    setRutCliente(resultado.rutCliente ?? '');
-    setNumeroOc(resultado.numeroOc ?? '');
+      if (errores.length > 0) setErroresParseo(errores);
 
-    const filasBase = resultado.productos.map((p) => ({
-      codigoProducto: p.codigoProducto,
-      descripcion: p.descripcion,
-      cantidad: p.cantidad,
-      cantidadEditable: p.cantidad,
-      estado: 'buscando',
-      productoId: null,
-      skuEncontrado: null,
-      nombreEnDB: null,
-    }));
-
-    setFilas(filasBase);
-    setPaso('preview');
-
-    function normalizarCodigo(codigo) {
-      return /^\d+$/.test(codigo) ? String(parseInt(codigo, 10)) : codigo;
-    }
-
-    const resoluciones = await Promise.allSettled(
-      resultado.productos.map((p) => productosApi.getBySku(normalizarCodigo(p.codigoProducto)))
-    );
-
-    setFilas(filasBase.map((fila, i) => {
-      const res = resoluciones[i];
-      if (res.status === 'fulfilled' && res.value) {
-        return {
-          ...fila,
-          estado: 'encontrado',
-          productoId: res.value.id,
-          skuEncontrado: res.value.sku,
-          nombreEnDB: res.value.nombre,
-        };
+      if (productosRaw.length === 0 && debugText) {
+        setTextoDebug(debugText);
+      } else {
+        setTextoDebug(null);
       }
-      return { ...fila, estado: 'no_encontrado' };
-    }));
 
-    setProcesando(false);
+      setNumeroNota(resultado.numeroNota || resultado.header?.numeroNota || '');
+      setNombreCliente(resultado.nombreCliente || resultado.header?.nombreCliente || '');
+      setRutCliente(resultado.rutCliente || resultado.header?.rutCliente || '');
+      setNumeroOc(resultado.numeroOc || resultado.header?.numeroOc || '');
+
+      // Filtrar filas basura
+      const productosValidos = productosRaw.filter((p) => {
+        const cod = (p.codigoProducto || p.sku || '').toString().trim();
+        const desc = (p.descripcion || p.nombre || '').toString().toUpperCase();
+        return (
+          cod.length > 0 &&
+          cod !== '19' &&
+          !desc.includes('TOTAL') &&
+          !desc.includes('PÁGINA')
+        );
+      });
+
+      const filasBase = productosValidos.map((p) => ({
+        codigoProducto: p.codigoProducto || p.sku || '',
+        descripcion: p.descripcion || p.nombre || 'Sin descripción',
+        cantidad: p.cantidad || p.cant || 1,
+        cantidadEditable: p.cantidad || p.cant || 1,
+        estado: 'buscando',
+        productoId: null,
+        skuEncontrado: null,
+        nombreEnDB: null,
+      }));
+
+      setFilas(filasBase);
+      setPaso('preview');
+
+      // Consultar productos en DB
+      const resoluciones = await Promise.allSettled(
+        productosValidos.map((p) => {
+          const codClean = normalizarCodigo(p.codigoProducto || p.sku);
+          return productosApi.getBySku
+            ? productosApi.getBySku(codClean)
+            : Promise.reject('Método getBySku no definido');
+        })
+      );
+
+      setFilas(
+        filasBase.map((fila, i) => {
+          const res = resoluciones[i];
+          if (res.status === 'fulfilled' && res.value) {
+            return {
+              ...fila,
+              estado: 'encontrado',
+              productoId: res.value.id || res.value.id_producto || null,
+              skuEncontrado: res.value.sku,
+              nombreEnDB: res.value.nombre,
+            };
+          }
+          return { ...fila, estado: 'no_encontrado' };
+        })
+      );
+    } catch (err) {
+      console.error('Error al procesar PDF:', err);
+      setErrorUI('Error al procesar el archivo PDF. Asegúrate de que tenga el formato correcto.');
+    } finally {
+      setProcesando(false);
+    }
   }
+
+  function actualizarCantidad(idx, valor) {
+    const n = parseInt(valor, 10);
+    if (isNaN(n) || n < 1) return;
+    setFilas((prev) =>
+      prev.map((f, i) => (i === idx ? { ...f, cantidadEditable: n } : f))
+    );
+  }
+
+  function eliminarFila(idx) {
+    setFilas((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  // ── Paso 2: Crear nota ────────────────────────────────────────────────────
 
   async function handleCrear() {
     setErrorUI(null);
 
-    if (!numeroNota.trim()) { setErrorUI('El número de NV es obligatorio.'); return; }
-    if (!nombreCliente.trim()) { setErrorUI('El nombre del cliente es obligatorio.'); return; }
-    if (!rutCliente.trim()) { setErrorUI('El RUT del cliente es obligatorio.'); return; }
+    if (!numeroNota.trim()) {
+      setErrorUI('El número de Nota de Venta es obligatorio.');
+      return;
+    }
+    if (!nombreCliente.trim()) {
+      setErrorUI('El nombre del cliente es obligatorio.');
+      return;
+    }
+    if (!rutCliente.trim()) {
+      setErrorUI('El RUT del cliente es obligatorio.');
+      return;
+    }
 
-    const filasValidas = filas.filter((f) => f.estado === 'encontrado' && f.productoId);
+    const filasValidas = filas.filter(
+      (f) => f.estado === 'encontrado' && f.productoId
+    );
     if (filasValidas.length === 0) {
-      setErrorUI('No hay productos encontrados en el catálogo para asociar a esta nota.');
+      setErrorUI('No hay productos vinculados con el catálogo para registrar la nota.');
       return;
     }
 
@@ -101,7 +161,7 @@ export function ImportarNotaFlow({ adminId, onVolver, onCreada }) {
         nombreCliente: nombreCliente.trim(),
         rutCliente: rutCliente.trim(),
         numeroOc: numeroOc.trim() || undefined,
-        archivoNombre: archivoPDF.name,
+        archivoNombre: archivoPDF ? archivoPDF.name : '',
         comentarioDespacho: comentarioDespacho.trim() || undefined,
         productos: filasValidas.map((f) => ({
           productoId: f.productoId,
@@ -109,9 +169,9 @@ export function ImportarNotaFlow({ adminId, onVolver, onCreada }) {
         })),
       });
 
-      onCreada(resultado.notaId);
+      onCreada(resultado?.notaId || resultado?.id_nv || resultado?.id);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Error de conexión con Supabase';
+      const msg = err instanceof Error ? err.message : 'Error de conexión';
       setErrorUI(msg);
     } finally {
       setCreando(false);
@@ -123,161 +183,272 @@ export function ImportarNotaFlow({ adminId, onVolver, onCreada }) {
   const buscandoAun = filas.some((f) => f.estado === 'buscando');
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 p-6 font-sans">
-      <div className="flex items-center gap-4 mb-6 pb-4 border-b border-slate-800">
+      <div className="w-full min-h-screen bg-slate-950 p-6 text-slate-100">
+        <div className="max-w-7xl mx-auto bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6">
         <button
           onClick={onVolver}
-          className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-sm font-semibold"
+          className="inline-flex items-center gap-2 text-sm font-medium text-slate-400 hover:text-white transition-colors"
         >
-          ← Volver
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+          </svg>
+          Volver
         </button>
-        <h2 className="text-xl font-bold text-white">Nueva Nota de Venta (Importación PDF)</h2>
+        <h2 className="text-xl font-bold text-white tracking-tight">
+          Importar Nota de Venta
+        </h2>
       </div>
 
-      {/* Paso 1: Carga de Archivo */}
+      {/* ── Paso 1: Upload ── */}
       {paso === 'upload' && (
-        <div className="max-w-xl mx-auto bg-slate-800 p-8 rounded-xl border border-slate-700 shadow-xl">
-          <label className="block text-sm font-semibold text-slate-300 mb-2">
-            Seleccionar archivo PDF de Nota de Venta <span className="text-rose-400">*</span>
-          </label>
-          <input
-            ref={pdfRef}
-            type="file"
-            accept=".pdf"
-            className="hidden"
-            onChange={(e) => setArchivoPDF(e.target.files?.[0] ?? null)}
-          />
-          <button
-            type="button"
-            onClick={() => pdfRef.current?.click()}
-            className={`w-full py-12 border-2 border-dashed rounded-lg flex flex-col items-center justify-center transition-all ${
-              archivoPDF
-                ? 'border-emerald-500/50 bg-emerald-950/20 text-emerald-400'
-                : 'border-slate-600 bg-slate-900/50 hover:border-sky-500 text-slate-400'
-            }`}
-          >
-            <span className="text-3xl mb-2">{archivoPDF ? '📄' : '📎'}</span>
-            <span className="font-semibold text-sm">
-              {archivoPDF ? archivoPDF.name : 'Haga clic para examinar su documento PDF'}
-            </span>
-          </button>
+        <div className="max-w-xl mx-auto py-8">
+          <div className="mb-6 text-center">
+            <label className="block text-sm font-medium text-slate-300 mb-2">
+              Documento Nota de Venta (PDF) <span className="text-rose-400">*</span>
+            </label>
+            <input
+              ref={pdfRef}
+              type="file"
+              accept=".pdf"
+              className="hidden"
+              onChange={(e) => setArchivoPDF(e.target.files?.[0] ?? null)}
+            />
+            <div
+              onClick={() => pdfRef.current?.click()}
+              className={`border-2 border-dashed rounded-2xl p-8 cursor-pointer transition-all flex flex-col items-center justify-center gap-3 ${
+                archivoPDF
+                  ? 'border-emerald-500/50 bg-emerald-950/20 text-emerald-300'
+                  : 'border-slate-700 hover:border-sky-500 bg-slate-800/40 hover:bg-slate-800/80 text-slate-400'
+              }`}
+            >
+              <div className="p-3 bg-slate-800 rounded-full border border-slate-700">
+                <svg className="w-8 h-8 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+              </div>
+              {archivoPDF ? (
+                <span className="font-semibold text-sm text-emerald-400 truncate max-w-xs">
+                  {archivoPDF.name}
+                </span>
+              ) : (
+                <div className="text-center">
+                  <span className="text-sm font-medium text-slate-200 block">Haz clic para seleccionar el PDF</span>
+                  <span className="text-xs text-slate-500">Solo archivos en formato .pdf</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {errorUI && (
+            <div className="mb-4 p-3 bg-rose-950/50 border border-rose-800/60 rounded-xl text-rose-300 text-sm">
+              {errorUI}
+            </div>
+          )}
 
           <button
             onClick={handleProcesar}
             disabled={!archivoPDF || procesando}
-            className="w-full mt-6 py-3 bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-bold rounded-lg text-sm"
+            className="w-full py-3 px-4 bg-sky-600 hover:bg-sky-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-semibold rounded-xl transition shadow-lg shadow-sky-950/50 flex items-center justify-center gap-2"
           >
-            {procesando ? 'Procesando y extrayendo datos...' : 'Procesar PDF'}
+            {procesando ? (
+              <>
+                <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Procesando Documento...
+              </>
+            ) : (
+              'Procesar Nota de Venta'
+            )}
           </button>
         </div>
       )}
 
-      {/* Paso 2: Previsualización y Edición */}
+      {/* ── Paso 2: Preview ── */}
       {paso === 'preview' && (
-        <div className="max-w-4xl mx-auto space-y-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 bg-slate-800 p-6 rounded-xl border border-slate-700">
+        <div className="space-y-6">
+          {/* Metadata Cabecera */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 bg-slate-800/40 p-4 rounded-xl border border-slate-800">
             <div>
-              <label className="block text-xs font-semibold text-slate-400 mb-1">N° NOTA DE VENTA *</label>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">
+                N° Nota de Venta <span className="text-rose-400">*</span>
+              </label>
               <input
                 type="text"
                 value={numeroNota}
+                onKeyDown={onlyNumbersKeyDown}
+                onPaste={onlyNumbersPaste}
                 onChange={(e) => setNumeroNota(e.target.value)}
-                className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded text-sm text-white"
+                placeholder="12345"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:border-sky-500"
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-400 mb-1">CLIENTE *</label>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">
+                Cliente <span className="text-rose-400">*</span>
+              </label>
               <input
                 type="text"
                 value={nombreCliente}
                 onChange={(e) => setNombreCliente(e.target.value)}
-                className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded text-sm text-white"
+                placeholder="Nombre del cliente"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:border-sky-500"
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-400 mb-1">RUT CLIENTE *</label>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">
+                RUT Cliente <span className="text-rose-400">*</span>
+              </label>
               <input
                 type="text"
                 value={rutCliente}
                 onChange={(e) => setRutCliente(e.target.value)}
-                className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded text-sm text-white"
+                placeholder="12.345.678-9"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:border-sky-500"
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-400 mb-1">N° OC (OPCIONAL)</label>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">
+                N° OC <span className="text-slate-500 lowercase">(opcional)</span>
+              </label>
               <input
                 type="text"
                 value={numeroOc}
+                onKeyDown={onlyNumbersKeyDown}
+                onPaste={onlyNumbersPaste}
                 onChange={(e) => setNumeroOc(e.target.value)}
-                className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded text-sm text-white"
+                placeholder="—"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:border-sky-500"
               />
             </div>
             <div className="md:col-span-2 lg:col-span-4">
-              <label className="block text-xs font-semibold text-slate-400 mb-1">OBSERVACIÓN DE DESPACHO</label>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">
+                Comentario de Despacho
+              </label>
               <textarea
                 rows={2}
                 value={comentarioDespacho}
                 onChange={(e) => setComentarioDespacho(e.target.value)}
-                placeholder="Ej: Despachar antes del mediodía..."
-                className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded text-sm text-white"
+                placeholder="Indicaciones para despacho o recepción..."
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:border-sky-500 resize-none"
               />
             </div>
           </div>
 
           {erroresParseo.length > 0 && (
-            <div className="bg-amber-950/40 border border-amber-500/50 p-4 rounded-lg text-amber-300 text-xs space-y-1">
-              {erroresParseo.map((e, i) => <p key={i}>⚠️ {e}</p>)}
+            <div className="p-3 bg-amber-950/40 border border-amber-700/50 rounded-xl text-amber-200 text-xs space-y-1">
+              {erroresParseo.map((e, i) => (
+                <p key={i}>• {e}</p>
+              ))}
             </div>
           )}
 
-          {/* Tabla de Productos Extraídos */}
-          <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden">
-            <div className="p-4 bg-slate-950/40 border-b border-slate-700 font-bold text-sm text-slate-300">
-              Productos Detectados ({filas.length})
+          {textoDebug && (
+            <details className="bg-slate-950 p-3 rounded-lg border border-slate-800 text-xs text-slate-400">
+              <summary className="cursor-pointer font-medium text-slate-300">Texto detectado en el PDF</summary>
+              <pre className="mt-2 whitespace-pre-wrap font-mono text-[11px] text-slate-500">{textoDebug}</pre>
+            </details>
+          )}
+
+          {/* Lista de productos */}
+          <div>
+            <div className="flex justify-between items-center mb-3">
+              <h3 className="text-sm font-semibold text-slate-300">
+                Productos Identificados ({filas.length})
+              </h3>
+              <div className="flex gap-2 text-xs">
+                <span className="text-emerald-400 font-medium">{totalEncontrados} listos</span>
+                {totalNoEncontrados > 0 && (
+                  <span className="text-rose-400 font-medium">• {totalNoEncontrados} sin catálogo</span>
+                )}
+              </div>
             </div>
-            <div className="divide-y divide-slate-700/50">
+
+            <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
               {filas.map((fila, idx) => (
-                <div key={idx} className="p-4 flex items-center justify-between gap-4">
-                  <div>
-                    <p className="font-semibold text-sm text-white">{fila.descripcion}</p>
-                    <p className="text-xs font-mono text-slate-400">SKU en PDF: {fila.codigoProducto}</p>
+                <div
+                  key={idx}
+                  className="bg-slate-800/60 border border-slate-700/70 p-3 rounded-xl flex items-center justify-between gap-4"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="font-semibold text-sm text-slate-200 truncate">
+                      {fila.nombreEnDB || fila.descripcion}
+                    </p>
+                    <code className="text-xs text-slate-400 bg-slate-900/80 px-2 py-0.5 rounded border border-slate-800">
+                      SKU: {fila.codigoProducto}
+                    </code>
                   </div>
+
                   <div className="flex items-center gap-4">
-                    <span className="font-mono text-sm bg-slate-900 px-3 py-1 rounded border border-slate-700">
-                      Cant: {fila.cantidad}
-                    </span>
-                    {fila.estado === 'buscando' && <span className="text-xs text-slate-400">Verificando...</span>}
-                    {fila.estado === 'encontrado' && <span className="text-emerald-400 text-xs font-bold">✓ Registrado ({fila.skuEncontrado})</span>}
-                    {fila.estado === 'no_encontrado' && <span className="bg-rose-500/20 text-rose-300 text-xs px-2 py-0.5 rounded border border-rose-500/40 font-bold">No en catálogo</span>}
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-slate-400 font-medium">Cant:</span>
+                      <input
+                        type="text"
+                        value={fila.cantidadEditable}
+                        onKeyDown={onlyNumbersKeyDown}
+                        onPaste={onlyNumbersPaste}
+                        onChange={(e) => actualizarCantidad(idx, e.target.value)}
+                        className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-center text-sm font-bold text-white focus:outline-none focus:border-sky-500"
+                      />
+                    </div>
+
+                    <div className="w-28 text-right">
+                      {fila.estado === 'buscando' && (
+                        <span className="inline-flex items-center text-xs text-amber-400 bg-amber-950/40 px-2 py-1 rounded border border-amber-800/40">
+                          Buscando...
+                        </span>
+                      )}
+                      {fila.estado === 'encontrado' && (
+                        <span className="inline-flex items-center text-xs text-emerald-400 bg-emerald-950/40 px-2.5 py-1 rounded-md border border-emerald-800/40 font-medium">
+                          ✓ Encontrado
+                        </span>
+                      )}
+                      {fila.estado === 'no_encontrado' && (
+                        <span className="inline-flex items-center text-xs text-rose-400 bg-rose-950/40 px-2.5 py-1 rounded-md border border-rose-800/40 font-medium">
+                          Sin Catálogo
+                        </span>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => eliminarFila(idx)}
+                      className="text-slate-500 hover:text-rose-400 p-1 transition-colors"
+                      title="Eliminar producto"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
                   </div>
                 </div>
               ))}
             </div>
           </div>
 
-          {errorUI && <div className="p-3 bg-rose-600/30 border border-rose-500 text-rose-300 rounded text-xs">{errorUI}</div>}
+          {errorUI && (
+            <div className="p-3 bg-rose-950/50 border border-rose-800/60 rounded-xl text-rose-300 text-sm">
+              {errorUI}
+            </div>
+          )}
 
-          <div className="flex justify-between items-center pt-2">
+          {/* Botones de acción */}
+          <div className="flex items-center justify-between pt-4 border-t border-slate-800">
             <button
               onClick={() => setPaso('upload')}
-              className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-sm font-semibold"
+              className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-sm font-medium transition"
             >
               ← Cambiar archivo
             </button>
             <button
               onClick={handleCrear}
               disabled={creando || buscandoAun || totalEncontrados === 0}
-              className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold rounded-lg text-sm"
+              className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-semibold rounded-xl transition shadow-lg shadow-emerald-950/50 flex items-center gap-2 text-sm"
             >
-              {creando ? 'Creando Nota...' : `Crear Nota de Venta (${totalEncontrados} válidos)`}
+              {creando ? 'Guardando Nota...' : `Crear Nota de Venta (${totalEncontrados})`}
             </button>
           </div>
-
-          {totalNoEncontrados > 0 && (
-            <p className="text-xs text-amber-400 text-center">
-              * Los {totalNoEncontrados} productos no registrados en el catálogo serán omitidos al guardar.
-            </p>
-          )}
         </div>
       )}
     </div>
